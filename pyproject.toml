@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jepa-poc"
+version = "0.1.0"
+description = "Proof-of-concept JEPA model for T-cell single-cell RNA-seq."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "pytorch-lightning>=2.2",
+    "anndata>=0.10",
+    "scanpy>=1.10",
+    "scvi-tools>=1.1",
+    "scikit-learn>=1.4",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "omegaconf>=2.3",
+    "matplotlib>=3.8",
+    "umap-learn>=0.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

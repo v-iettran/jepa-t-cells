@@ -1,0 +1,109 @@
+seed: 13
+
+data:
+  # All 12 cell-level shards from CZI "Primary Human CD4+ T Cell Perturb-seq"
+  # (4 donors x 3 conditions). prep_data.py streams these one at a time.
+  perturb_seq_shards:
+    - data/raw/perturb_seq/D1_Rest.assigned_guide.h5ad
+    - data/raw/perturb_seq/D1_Stim8hr.assigned_guide.h5ad
+    - data/raw/perturb_seq/D1_Stim48hr.assigned_guide.h5ad
+    - data/raw/perturb_seq/D2_Rest.assigned_guide.h5ad
+    - data/raw/perturb_seq/D2_Stim8hr.assigned_guide.h5ad
+    - data/raw/perturb_seq/D2_Stim48hr.assigned_guide.h5ad
+    - data/raw/perturb_seq/D3_Rest.assigned_guide.h5ad
+    - data/raw/perturb_seq/D3_Stim8hr.assigned_guide.h5ad
+    - data/raw/perturb_seq/D3_Stim48hr.assigned_guide.h5ad
+    - data/raw/perturb_seq/D4_Rest.assigned_guide.h5ad
+    - data/raw/perturb_seq/D4_Stim8hr.assigned_guide.h5ad
+    - data/raw/perturb_seq/D4_Stim48hr.assigned_guide.h5ad
+  pseudobulk_path: data/raw/perturb_seq/GWCD4i.pseudobulk_merged.h5ad
+  de_stats_path: data/raw/perturb_seq/GWCD4i.DE_stats.h5ad
+  sgrna_library_path: data/raw/perturb_seq/sgrna_library_metadata.suppl_table.csv
+  guide_kd_path: data/raw/perturb_seq/guide_kd_efficiency.suppl_table.csv
+  sample_metadata_path: data/raw/perturb_seq/sample_metadata.suppl_table.csv
+
+  output_dir: data/processed
+  run_dir: runs/poc
+  gene_vocab_path: data/processed/gene_vocab.tsv
+
+  # With 12 shards: ~900K NTC total and ~25M targeting cells (pre-filter).
+  # perturb_control_cells caps the NTC pool that feeds annotation eval + pretrain.
+  # perturb_eval_cells caps total targeting cells (split per-shard inside prep_data).
+  perturb_control_cells: 500000
+  # ~250K targeting cells per shard. CZI Perturb-seq cells have ~20% gene
+  # density, so concat-peak memory ≈ 3M × 18130 × 20% × 8B ≈ 90 GB sparse.
+  perturb_eval_cells: 3000000
+  hvg_count: 2000
+  split_seed: 13
+
+  # CZI .obs column names. culture_condition / donor_id / 10xrun_id are injected
+  # by prep_data.py from filename + sample_metadata.suppl_table.csv.
+  batch_key: 10xrun_id
+  donor_key: donor_id
+  label_key: culture_condition
+  perturbation_key: perturbed_gene_name
+  guide_type_key: guide_type
+  low_quality_key: low_quality
+  control_label: control
+  non_targeting_guide_type: non-targeting
+  # Keep only cells whose guide has signif_knockdown=True. Requires
+  # guide_kd_efficiency.suppl_table.csv to be present.
+  effective_guides_only: true
+
+  # 3-class culture-condition annotation task (replaces the 12-class atlas labels).
+  condition_groups:
+    Rest: ["Rest"]
+    Stim8hr: ["Stim8hr"]
+    Stim48hr: ["Stim48hr"]
+
+  # Held-out perturbations for the perturbation eval (leave-one-gene-out).
+  # Placeholder list — re-pick by stratifying GWCD4i.DE_stats.h5ad on
+  # ontarget_effect_size with ontarget_significant=True.
+  heldout_perturbation_genes: ["IL2RA", "FOXP3", "CD28", "CTLA4", "STAT3"]
+
+model:
+  d_model: 256
+  n_layers: 4
+  n_heads: 4
+  predictor_layers: 2
+  dropout: 0.1
+  max_batches: 128
+  mask_context_frac: 0.30
+  n_target_blocks: 2
+  target_block_frac: 0.20
+  vicreg_weight: 0.01
+
+train:
+  batch_size: 512
+  num_workers: 4
+  lr: 0.0001
+  weight_decay: 0.05
+  warmup_steps: 5000
+  # Bumped from 100k to use the longer 1-GPU wall budget. At ~1k steps/min
+  # this is ~3.3 days of pure training; collapse monitor + early-stop checkpoints
+  # still apply.
+  max_steps: 200000
+  ema_momentum_start: 0.996
+  ema_momentum_end: 1.0
+  precision: bf16-mixed
+  # Single A6000. Lightning picks the single-device strategy automatically.
+  devices: 1
+  strategy: auto
+  log_every_n_steps: 25
+  val_check_interval: 2000
+  collapse_std_threshold: 0.01
+  collapse_patience: 100
+  # Save the train state every N steps so a crash doesn't lose >1h of work.
+  ckpt_every_n_steps: 5000
+
+eval:
+  pca_components: 50
+  scvi_latent_dim: 10
+  linear_probe_c_grid: [0.1, 1.0, 10.0]
+  knn_k: 15
+  perturb_head_hidden: 256
+  perturb_head_epochs: 20
+  top_k_de: [20, 100]
+  # Dims of the non-leaky co-expression gene-identity embedding (SVD of control
+  # pseudobulk) used as the perturbation-head feature.
+  coexpr_components: 50
