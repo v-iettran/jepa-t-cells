@@ -1,0 +1,32 @@
+{
+  "original_exp1_subset": [
+    "CD28",
+    "CTLA4",
+    "FOXP3",
+    "IL2RA",
+    "STAT3"
+  ],
+  "experiment_2_heldout_genes": [
+    "CD28",
+    "CTLA4",
+    "FOXP3",
+    "IL2RA",
+    "STAT3",
+    "BATF",
+    "BCL2",
+    "CCR7",
+    "EGR2",
+    "EGR3",
+    "FOS",
+    "ICOS",
+    "IFNG",
+    "IRF4",
+    "JUNB",
+    "LAG3",
+    "NFKB1",
+    "PDCD1",
+    "TNFRSF4",
+    "TOX"
+  ],
+  "selection_note": "Expanded from the Experiment 1 five-gene subset to 20 immune-regulatory, activation, signaling, and checkpoint genes. Validate availability in perturb_eval_processed_4000.h5ad before training heads."
+}

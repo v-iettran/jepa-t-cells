@@ -43,16 +43,35 @@ def _make_loader(ds: TCellDataset, batch_size: int, shuffle: bool, num_workers: 
     )
 
 
+def _configured_path(cfg, key: str, default_name: str) -> Path:
+    configured = getattr(cfg.data, key, None)
+    if configured:
+        return Path(configured)
+    return Path(cfg.data.output_dir) / default_name
+
+
+def _run_dir(cfg, arm: str | None) -> Path:
+    base = Path(cfg.data.run_dir)
+    if arm is None:
+        return base
+    key = f"run_dir_{arm.lower()}"
+    configured = getattr(cfg.data, key, None)
+    if configured:
+        return Path(configured)
+    return base.parent / f"{base.name}_{arm}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/poc.yaml")
     parser.add_argument("--resume", default=None, help="Optional explicit checkpoint to resume from.")
+    parser.add_argument("--arm", choices=["A0", "A1"], default=None, help="Experiment 2 encoder arm.")
     args = parser.parse_args()
     cfg = load_config(args.config)
-    processed = Path(cfg.data.output_dir) / "pretrain_processed.h5ad"
+    processed = _configured_path(cfg, "pretrain_processed_path", "pretrain_processed.h5ad")
     if not processed.exists():
         raise FileNotFoundError(f"{processed} not found. Run scripts/prep_data.py first.")
-    run_dir = ensure_dir(cfg.data.run_dir)
+    run_dir = ensure_dir(_run_dir(cfg, args.arm))
     pl.seed_everything(int(cfg.seed), workers=True)
 
     _log(f"Loading {processed}")
@@ -87,7 +106,13 @@ def main() -> None:
     train_loader = _make_loader(train_ds, cfg.train.batch_size, shuffle=True, num_workers=cfg.train.num_workers)
     val_loader = _make_loader(val_ds, cfg.train.batch_size, shuffle=False, num_workers=cfg.train.num_workers)
 
-    model = JEPA(
+    model_cls = JEPA
+    if args.arm == "A1":
+        from jepa_poc.models.jepa_sigreg import JEPASIGReg
+
+        model_cls = JEPASIGReg
+
+    model = model_cls(
         n_genes=adata.n_vars,
         n_batches=max(1, len(encoders.batch_to_id)),
         d_model=cfg.model.d_model,
@@ -111,6 +136,7 @@ def main() -> None:
         max_steps=cfg.train.max_steps,
         ema_momentum_start=cfg.train.ema_momentum_start,
         ema_momentum_end=cfg.train.ema_momentum_end,
+        geometry_log_every_n_steps=int(getattr(cfg.train, "geometry_log_every_n_steps", 2000)),
     )
 
     ckpt_dir = ensure_dir(run_dir / "checkpoints")

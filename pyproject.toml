@@ -9,7 +9,7 @@ description = "Proof-of-concept JEPA model for T-cell single-cell RNA-seq."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.2",
+    "torch==2.6.0",
     "pytorch-lightning>=2.2",
     "anndata>=0.10",
     "scanpy>=1.10",
@@ -20,6 +20,9 @@ dependencies = [
     "omegaconf>=2.3",
     "matplotlib>=3.8",
     "umap-learn>=0.5",
+    "networkx>=3.2",
+    "pyarrow>=15.0",
+    "lejepa @ git+https://github.com/rbalestr-lab/lejepa.git",
 ]
 
 [project.optional-dependencies]

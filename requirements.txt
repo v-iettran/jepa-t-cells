@@ -1,4 +1,4 @@
-torch>=2.2
+torch==2.6.0
 pytorch-lightning>=2.2
 anndata>=0.10
 scanpy>=1.10
@@ -10,3 +10,6 @@ omegaconf>=2.3
 matplotlib>=3.8
 umap-learn>=0.5
 pytest>=8.0
+networkx>=3.2
+pyarrow>=15.0
+lejepa @ git+https://github.com/rbalestr-lab/lejepa.git

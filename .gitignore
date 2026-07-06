@@ -12,6 +12,8 @@ runs/
 outputs/
 checkpoints/
 *.ckpt
+*.pt
+*.npz
 *.h5ad
 *.zarr/
 *.png

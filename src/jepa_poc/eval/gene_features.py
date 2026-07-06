@@ -20,6 +20,7 @@ from pathlib import Path
 
 import anndata as ad
 import numpy as np
+import torch
 from scipy import sparse
 from sklearn.decomposition import TruncatedSVD
 
@@ -97,4 +98,61 @@ def features_for_names(
     for i, name in enumerate(names.astype(str)):
         token = name.replace("KO_", "").replace("KD_", "").replace("perturb_", "").upper()
         out[i] = sym_to_vec.get(token, fallback)
+    return out
+
+
+def _clean_symbol(name: str) -> str:
+    return name.replace("KO_", "").replace("KD_", "").replace("perturb_", "").upper()
+
+
+def gene_names_from_adata(adata: ad.AnnData) -> list[str]:
+    if "gene_symbol" in adata.var:
+        return adata.var["gene_symbol"].astype(str).tolist()
+    if "gene_name" in adata.var:
+        return adata.var["gene_name"].astype(str).tolist()
+    return [str(g) for g in adata.var_names]
+
+
+def jepa_gene_embedding_features(
+    names: np.ndarray,
+    gene_names: list[str],
+    embedding_weight: torch.Tensor,
+) -> np.ndarray:
+    """Look up learned JEPA gene-token embeddings for perturbation names."""
+
+    gene_to_idx = {_clean_symbol(g): i for i, g in enumerate(gene_names)}
+    weight = embedding_weight.detach().cpu().numpy().astype(np.float32)
+    fallback = weight.mean(axis=0)
+    out = np.empty((len(names), weight.shape[1]), dtype=np.float32)
+    for i, name in enumerate(names.astype(str)):
+        idx = gene_to_idx.get(_clean_symbol(name))
+        out[i] = weight[idx] if idx is not None else fallback
+    return out
+
+
+def grn_state_features(
+    names: np.ndarray,
+    states: np.ndarray,
+    gene_names: list[str],
+    grn_dir: str | Path,
+) -> np.ndarray:
+    """Look up state-matched GENIE3 graph embeddings for perturbation names."""
+
+    grn_dir = Path(grn_dir)
+    state_to_file = {
+        "Rest": grn_dir / "gene_emb_grn_rest.npy",
+        "Stim8hr": grn_dir / "gene_emb_grn_stim8hr.npy",
+        "Stim48hr": grn_dir / "gene_emb_grn_stim48hr.npy",
+    }
+    state_to_emb = {state: np.load(path).astype(np.float32) for state, path in state_to_file.items() if path.exists()}
+    if not state_to_emb:
+        raise FileNotFoundError(f"No GRN embedding files found in {grn_dir}")
+    dim = next(iter(state_to_emb.values())).shape[1]
+    fallback = np.mean(np.concatenate(list(state_to_emb.values()), axis=0), axis=0)
+    gene_to_idx = {_clean_symbol(g): i for i, g in enumerate(gene_names)}
+    out = np.empty((len(names), dim), dtype=np.float32)
+    for i, (name, state) in enumerate(zip(names.astype(str), states.astype(str), strict=True)):
+        emb = state_to_emb.get(str(state))
+        idx = gene_to_idx.get(_clean_symbol(name))
+        out[i] = emb[idx] if emb is not None and idx is not None else fallback
     return out

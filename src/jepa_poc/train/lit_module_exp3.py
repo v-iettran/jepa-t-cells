@@ -1,3 +1,12 @@
+"""Lightning module for Experiment 3 (Arm 1 / Arm 2 JEPA + reconstruction).
+
+Logs every loss term separately (prediction, reconstruction, and VICReg or
+SIGReg) plus CLS-embedding geometry canaries (per-dim std, effective rank,
+mean pairwise cosine) identically for both arms. EMA is applied only when the
+model exposes a real (non-symmetric) teacher; Arm 2's ``update_target_encoder``
+is a no-op.
+"""
+
 from __future__ import annotations
 
 import math
@@ -8,19 +17,17 @@ import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
-from jepa_poc.models.jepa import JEPA
+from jepa_poc.models.jepa_recon import JEPAReconBase
 
 
-class JEPALitModule(pl.LightningModule):
-    """Lightning wrapper for JEPA pretraining."""
-
+class Exp3LitModule(pl.LightningModule):
     def __init__(
         self,
-        model: JEPA,
+        model: JEPAReconBase,
         lr: float = 1e-4,
         weight_decay: float = 0.05,
         warmup_steps: int = 5000,
-        max_steps: int = 100000,
+        max_steps: int = 200000,
         ema_momentum_start: float = 0.996,
         ema_momentum_end: float = 1.0,
         geometry_log_every_n_steps: int = 2000,
@@ -34,6 +41,7 @@ class JEPALitModule(pl.LightningModule):
         self.ema_momentum_start = ema_momentum_start
         self.ema_momentum_end = ema_momentum_end
         self.geometry_log_every_n_steps = geometry_log_every_n_steps
+        self.use_ema = not getattr(model, "is_symmetric", False)
         self.save_hyperparameters(ignore=["model"])
 
     def _ema_momentum(self) -> float:
@@ -50,7 +58,8 @@ class JEPALitModule(pl.LightningModule):
             {
                 "train/loss": losses.loss,
                 "train/prediction_loss": losses.prediction_loss,
-                "train/variance_loss": losses.variance_loss,
+                "train/recon_loss": losses.recon_loss,
+                "train/stabilization_loss": losses.stabilization_loss,
                 "train/target_std": losses.target_std,
             },
             prog_bar=True,
@@ -68,6 +77,8 @@ class JEPALitModule(pl.LightningModule):
             {
                 "val/loss": losses.loss,
                 "val/prediction_loss": losses.prediction_loss,
+                "val/recon_loss": losses.recon_loss,
+                "val/stabilization_loss": losses.stabilization_loss,
                 "val/target_std": losses.target_std,
             },
             prog_bar=True,
@@ -77,22 +88,37 @@ class JEPALitModule(pl.LightningModule):
         return losses.loss
 
     def _log_geometry(self, z: torch.Tensor, prefix: str) -> None:
+        """Log CLS-embedding geometry canaries.
+
+        Effective rank is computed from the singular values of the centered
+        embedding matrix (numerically stable), not from ``eigvalsh`` on the
+        covariance, which fails to converge when the spectrum is highly
+        anisotropic / near-degenerate (LinAlgError 257). The whole block is
+        guarded so a logging failure never kills training.
+        """
         device_type = z.device.type
-        with torch.autocast(device_type=device_type, enabled=False):
-            z = z.detach().to(dtype=torch.float32)
-            std = z.std(dim=0, unbiased=False)
-            centered = z - z.mean(dim=0, keepdim=True)
-            cov = centered.T @ centered / max(1, z.shape[0] - 1)
-            eigvals = torch.linalg.eigvalsh(cov).clamp_min(0)
-            probs = eigvals / eigvals.sum().clamp_min(1e-12)
-            entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum()
-            effective_rank = torch.exp(entropy)
-            normed = torch.nn.functional.normalize(z, dim=1)
-            cosine = normed @ normed.T
-            if cosine.numel() > z.shape[0]:
-                off_diag_mean = (cosine.sum() - cosine.diag().sum()) / (cosine.numel() - z.shape[0])
-            else:
-                off_diag_mean = torch.zeros((), device=z.device)
+        try:
+            with torch.autocast(device_type=device_type, enabled=False):
+                z = z.detach().to(dtype=torch.float32)
+                n = z.shape[0]
+                std = z.std(dim=0, unbiased=False)
+                centered = z - z.mean(dim=0, keepdim=True)
+                # Singular values of the centered matrix; s_i^2 / (n-1) are the
+                # covariance eigenvalues but svdvals is far more robust.
+                svals = torch.linalg.svdvals(centered)
+                var = (svals ** 2) / max(1, n - 1)
+                probs = var / var.sum().clamp_min(1e-12)
+                entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum()
+                effective_rank = torch.exp(entropy)
+                normed = torch.nn.functional.normalize(z, dim=1)
+                cosine = normed @ normed.T
+                if cosine.numel() > n:
+                    off_diag_mean = (cosine.sum() - cosine.diag().sum()) / (cosine.numel() - n)
+                else:
+                    off_diag_mean = torch.zeros((), device=z.device)
+        except Exception as exc:  # pragma: no cover - logging must never crash training
+            print(f"[geometry] skipped logging at step {self.global_step}: {exc}", flush=True)
+            return
         self.log_dict(
             {
                 f"{prefix}/std_mean": std.mean(),
@@ -105,11 +131,13 @@ class JEPALitModule(pl.LightningModule):
         )
 
     def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
-        self.model.update_target_encoder(self._ema_momentum())
-        self.log("train/ema_momentum", self._ema_momentum(), on_step=True, on_epoch=False)
+        if self.use_ema:
+            self.model.update_target_encoder(self._ema_momentum())
+            self.log("train/ema_momentum", self._ema_momentum(), on_step=True, on_epoch=False)
 
     def configure_optimizers(self) -> dict[str, Any]:
-        optimizer = AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        params = [p for p in self.parameters() if p.requires_grad]
+        optimizer = AdamW(params, lr=self.lr, weight_decay=self.weight_decay)
 
         def lr_lambda(step: int) -> float:
             if step < self.warmup_steps:

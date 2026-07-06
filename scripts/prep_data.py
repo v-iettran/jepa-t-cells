@@ -54,13 +54,31 @@ def _standardize_var_names(adata: ad.AnnData) -> ad.AnnData:
     return adata
 
 
-def _assign_donor_split(adata: ad.AnnData, donor_key: str, seed: int) -> ad.AnnData:
+def _assign_donor_split(
+    adata: ad.AnnData,
+    donor_key: str,
+    seed: int,
+    split_path: str | Path | None = None,
+) -> ad.AnnData:
     rng = np.random.default_rng(seed)
     adata = adata.copy()
     if donor_key not in adata.obs:
         adata.obs["split"] = rng.choice(["train", "val", "test"], size=adata.n_obs, p=[0.8, 0.1, 0.1])
         return adata
     donors = np.array(sorted(adata.obs[donor_key].astype(str).unique()))
+
+    if split_path is not None and Path(split_path).exists():
+        split_cfg = json.loads(Path(split_path).read_text())
+        donor_to_split: dict[str, str] = {}
+        for split_name in ["train", "val", "test"]:
+            for donor in split_cfg.get(split_name, []):
+                donor_to_split[str(donor)] = split_name
+        missing = sorted(set(donors) - set(donor_to_split))
+        if missing:
+            raise RuntimeError(f"Donor split file {split_path} is missing donor(s): {missing}")
+        adata.obs["split"] = [donor_to_split[str(d)] for d in adata.obs[donor_key].astype(str)]
+        return adata
+
     rng.shuffle(donors)
     if len(donors) == 1:
         adata.obs["split"] = rng.choice(["train", "val", "test"], size=adata.n_obs, p=[0.8, 0.1, 0.1])
@@ -72,6 +90,15 @@ def _assign_donor_split(adata: ad.AnnData, donor_key: str, seed: int) -> ad.AnnD
     val = set(donors[n_train : n_train + n_val])
     split = ["train" if d in train else "val" if d in val else "test" for d in adata.obs[donor_key].astype(str)]
     adata.obs["split"] = split
+    if split_path is not None:
+        split_summary = {
+            "train": sorted(train),
+            "val": sorted(val),
+            "test": sorted(set(donors) - train - val),
+        }
+        path = Path(split_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(split_summary, indent=2))
     return adata
 
 
@@ -194,6 +221,15 @@ def _resident_gb() -> float:
     except OSError:
         pass
     return float("nan")
+
+
+def _configured_path(cfg, key: str, default_name: str) -> Path:
+    """Return an explicit data path when configured, else output_dir/default."""
+
+    configured = getattr(cfg.data, key, None)
+    if configured:
+        return Path(configured)
+    return Path(cfg.data.output_dir) / default_name
 
 
 def _stream_load_filtered(
@@ -509,9 +545,19 @@ def main() -> None:
     controls = _collapse_labels(controls, cfg.data.label_key, dict(cfg.data.condition_groups))
     targeting = _collapse_labels(targeting, cfg.data.label_key, dict(cfg.data.condition_groups))
 
-    controls_ann = _assign_donor_split(controls, cfg.data.donor_key, int(cfg.data.split_seed))
+    controls_ann = _assign_donor_split(
+        controls,
+        cfg.data.donor_key,
+        int(cfg.data.split_seed),
+        getattr(cfg.data, "donor_split_path", None),
+    )
 
-    heldout = set(map(str, cfg.data.heldout_perturbation_genes))
+    heldout_path = getattr(cfg.data, "heldout_genes_path", None)
+    if heldout_path and Path(heldout_path).exists():
+        heldout_cfg = json.loads(Path(heldout_path).read_text())
+        heldout = set(map(str, heldout_cfg.get("experiment_2_heldout_genes", heldout_cfg)))
+    else:
+        heldout = set(map(str, cfg.data.heldout_perturbation_genes))
     targeting.obs["split"] = [
         "test" if str(p) in heldout else "train" for p in targeting.obs[cfg.data.perturbation_key].astype(str)
     ]
@@ -525,13 +571,20 @@ def main() -> None:
     rng = np.random.default_rng(int(cfg.data.split_seed))
     pretrain.obs["split"] = rng.choice(["train", "val"], size=pretrain.n_obs, p=[0.9, 0.1])
 
+    annotation_path = _configured_path(cfg, "annotation_processed_path", "annotation_processed.h5ad")
+    perturb_controls_path = _configured_path(cfg, "perturb_controls_processed_path", "perturb_controls_processed.h5ad")
+    perturb_eval_path = _configured_path(cfg, "perturb_eval_processed_path", "perturb_eval_processed.h5ad")
+    pretrain_path = _configured_path(cfg, "pretrain_processed_path", "pretrain_processed.h5ad")
+    for path in [annotation_path, perturb_controls_path, perturb_eval_path, pretrain_path]:
+        ensure_dir(path.parent)
+
     _log(f"Writing processed h5ad files (pretrain={pretrain.n_obs:,}, annotation={controls_ann.n_obs:,}, "
          f"perturb_eval={targeting.n_obs:,}, perturb_controls={controls.n_obs:,})...")
     t0 = time.time()
-    controls_ann.write_h5ad(out_dir / "annotation_processed.h5ad")
-    controls.write_h5ad(out_dir / "perturb_controls_processed.h5ad")
-    targeting.write_h5ad(out_dir / "perturb_eval_processed.h5ad")
-    pretrain.write_h5ad(out_dir / "pretrain_processed.h5ad")
+    controls_ann.write_h5ad(annotation_path)
+    controls.write_h5ad(perturb_controls_path)
+    targeting.write_h5ad(perturb_eval_path)
+    pretrain.write_h5ad(pretrain_path)
     _log(f"Wrote 4 h5ad files in {time.time() - t0:.1f}s")
 
     split_summary = {
@@ -544,8 +597,10 @@ def main() -> None:
         },
         "n_hvgs": len(common),
     }
-    (out_dir / "split_summary.json").write_text(json.dumps(split_summary, indent=2))
-    _log(f"Wrote split_summary.json to {out_dir}")
+    split_summary_path = Path(getattr(cfg.data, "split_summary_path", out_dir / "split_summary.json"))
+    ensure_dir(split_summary_path.parent)
+    split_summary_path.write_text(json.dumps(split_summary, indent=2))
+    _log(f"Wrote split_summary.json to {split_summary_path}")
     print(json.dumps(split_summary, indent=2), flush=True)
     _log("prep_data done.")
 

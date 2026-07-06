@@ -19,6 +19,7 @@ gene, and per culture condition.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -29,7 +30,13 @@ import torch
 from jepa_poc.config import ensure_dir, load_config
 from jepa_poc.data.loader import TCellDataset, fit_encoders, make_dataloader
 from jepa_poc.eval.annotation import embed_loader
-from jepa_poc.eval.gene_features import build_coexpression_gene_embedding, features_for_names
+from jepa_poc.eval.gene_features import (
+    build_coexpression_gene_embedding,
+    features_for_names,
+    gene_names_from_adata,
+    grn_state_features,
+    jepa_gene_embedding_features,
+)
 from jepa_poc.eval.perturbation import (
     condition_group_means,
     decode_latent,
@@ -66,8 +73,14 @@ def _load_model(cfg, n_vars: int, n_batches: int, checkpoint: Path) -> JEPA:
     if checkpoint.exists():
         ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
         state = ckpt.get("state_dict", ckpt)
-        state = {k.removeprefix("model."): v for k, v in state.items() if k.startswith("model.")}
-        model.load_state_dict(state, strict=False)
+        if any(k.startswith("model.") for k in state):
+            state = {k.removeprefix("model."): v for k, v in state.items() if k.startswith("model.")}
+            model.load_state_dict(state, strict=False)
+        elif any(k.startswith("gene_embedding.") for k in state):
+            model.target_encoder.load_state_dict(state, strict=False)
+            model.context_encoder.load_state_dict(state, strict=False)
+        else:
+            model.load_state_dict(state, strict=False)
         _log(f"Loaded checkpoint {checkpoint} (step={ckpt.get('global_step', '?')})")
     else:
         _log(f"WARNING: checkpoint {checkpoint} not found; using random weights")
@@ -94,6 +107,66 @@ def _stratified_subsample(cond: np.ndarray, cap: int, rng: np.random.Generator) 
         take = min(per, pool.size)
         keep.append(rng.choice(pool, size=take, replace=False))
     return np.sort(np.concatenate(keep))
+
+
+def _configured_path(cfg, key: str, default_name: str) -> Path:
+    configured = getattr(cfg.data, key, None)
+    if configured:
+        return Path(configured)
+    return Path(cfg.data.output_dir) / default_name
+
+
+def _build_gene_features(
+    mode: str,
+    *,
+    names: np.ndarray,
+    states: np.ndarray,
+    model: JEPA,
+    gene_names: list[str],
+    cfg,
+) -> tuple[np.ndarray, str]:
+    if mode == "coexpression":
+        sym_to_vec, feat_dim = build_coexpression_gene_embedding(
+            cfg.data.pseudobulk_path,
+            n_components=int(getattr(cfg.eval, "coexpr_components", 50)),
+            guide_type_key=cfg.data.guide_type_key,
+            control_guide_type=cfg.data.non_targeting_guide_type,
+            seed=int(cfg.seed),
+        )
+        return features_for_names(names, sym_to_vec, feat_dim), f"coexpression_svd_{feat_dim}d"
+
+    if mode == "jepa":
+        return (
+            jepa_gene_embedding_features(names, gene_names, model.target_encoder.gene_embedding.weight),
+            f"jepa_gene_embedding_{model.target_encoder.gene_embedding.embedding_dim}d",
+        )
+
+    if mode == "grn":
+        grn_dir = getattr(cfg.grn, "output_dir", "data/grn") if "grn" in cfg else "data/grn"
+        feats = grn_state_features(names, states, gene_names, grn_dir)
+        return feats, f"grn_state_matched_{feats.shape[1]}d"
+
+    if mode == "grn_jepa":
+        grn_dir = getattr(cfg.grn, "output_dir", "data/grn") if "grn" in cfg else "data/grn"
+        grn_feats = grn_state_features(names, states, gene_names, grn_dir)
+        jepa_feats = jepa_gene_embedding_features(names, gene_names, model.target_encoder.gene_embedding.weight)
+        return np.concatenate([grn_feats, jepa_feats], axis=1), f"grn_plus_jepa_{grn_feats.shape[1] + jepa_feats.shape[1]}d"
+
+    raise ValueError(f"Unknown feature mode: {mode}")
+
+
+def _assert_grn_no_eval_leakage(cfg, eval_adata: ad.AnnData) -> None:
+    grn_dir = Path(getattr(cfg.grn, "output_dir", "data/grn") if "grn" in cfg else "data/grn")
+    barcode_files = sorted(grn_dir.glob("genie3_ntc_barcodes*.txt"))
+    if not barcode_files:
+        raise FileNotFoundError(f"No GENIE3 barcode files found in {grn_dir}")
+    grn_barcodes: set[str] = set()
+    for path in barcode_files:
+        grn_barcodes.update(line.strip() for line in path.read_text().splitlines() if line.strip())
+    overlap = grn_barcodes.intersection(map(str, eval_adata.obs_names))
+    if overlap:
+        raise RuntimeError(f"GENIE3 leakage guard failed: {len(overlap)} GRN input barcodes overlap perturbation eval cells")
+    _log(f"GENIE3 leakage guard passed ({len(grn_barcodes):,} GRN barcodes checked)")
 
 
 def _group_metrics(
@@ -152,16 +225,23 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/poc.yaml")
     parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--run-dir", default=None, help="Override output/cache directory for this eval arm.")
     parser.add_argument("--n-control", type=int, default=150000, help="controls to embed (stratified by condition)")
     parser.add_argument("--n-train-head", type=int, default=200000, help="train targeting cells to embed for the head")
     parser.add_argument("--refresh-embeddings", action="store_true", help="ignore cached embeddings")
+    parser.add_argument(
+        "--feature-mode",
+        choices=["coexpression", "jepa", "grn", "grn_jepa"],
+        default="coexpression",
+        help="Perturbation identity feature for the head arm.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    run_dir = ensure_dir(cfg.data.run_dir)
+    run_dir = ensure_dir(args.run_dir or cfg.data.run_dir)
     checkpoint = Path(args.checkpoint) if args.checkpoint else Path(cfg.data.run_dir) / "last.ckpt"
-    eval_path = Path(cfg.data.output_dir) / "perturb_eval_processed.h5ad"
-    control_path = Path(cfg.data.output_dir) / "perturb_controls_processed.h5ad"
+    eval_path = _configured_path(cfg, "perturb_eval_processed_path", "perturb_eval_processed.h5ad")
+    control_path = _configured_path(cfg, "perturb_controls_processed_path", "perturb_controls_processed.h5ad")
     if not eval_path.exists() or not control_path.exists():
         raise FileNotFoundError("Processed perturbation files not found. Run scripts/prep_data.py first.")
 
@@ -170,8 +250,15 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     rng = np.random.default_rng(int(cfg.seed))
 
+    # Cache embeddings keyed by the exact inputs they depend on: the encoder
+    # checkpoint and the subsample caps/seed. This lets different encoders (A0 vs
+    # A1) keep separate caches in the shared cache dir, and lets head runs reuse
+    # the selected encoder's embeddings instead of re-embedding from scratch.
     cache_dir = ensure_dir(Path(cfg.data.run_dir) / "_embed_cache")
-    cache_file = cache_dir / "perturb_embeds.npz"
+    _cache_key = hashlib.md5(
+        f"{checkpoint.resolve()}|nc={args.n_control}|nt={args.n_train_head}|seed={int(cfg.seed)}".encode()
+    ).hexdigest()[:12]
+    cache_file = cache_dir / f"perturb_embeds_{_cache_key}.npz"
 
     _log("Loading processed AnnData (eval + controls)")
     eval_adata = ad.read_h5ad(eval_path)
@@ -179,6 +266,8 @@ def main() -> None:
     combined_obs = ad.concat([control_adata, eval_adata], join="inner").obs
     encoders = fit_encoders(combined_obs, cfg.data.batch_key, "annotation_group", pkey)
     model = _load_model(cfg, eval_adata.n_vars, max(1, len(encoders.batch_to_id)), checkpoint)
+    if args.feature_mode in {"grn", "grn_jepa"}:
+        _assert_grn_no_eval_leakage(cfg, eval_adata)
 
     if cache_file.exists() and not args.refresh_embeddings:
         _log(f"Loading cached embeddings from {cache_file}")
@@ -241,19 +330,27 @@ def main() -> None:
         pred_expr=None, decoder=decoder, ctrl_means=ctrl_means, top_ks=top_ks, test_genes=test_genes,
     )
 
-    # ---------------- Part B: head prediction with co-expression features --------
-    _log("Part B: building co-expression gene features from control pseudobulk")
-    sym_to_vec, feat_dim = build_coexpression_gene_embedding(
-        cfg.data.pseudobulk_path,
-        n_components=int(getattr(cfg.eval, "coexpr_components", 50)),
-        guide_type_key=cfg.data.guide_type_key,
-        control_guide_type=cfg.data.non_targeting_guide_type,
-        seed=int(cfg.seed),
+    # ---------------- Part B: head prediction with selected gene features --------
+    gene_names = gene_names_from_adata(eval_adata)
+    _log(f"Part B: building '{args.feature_mode}' gene features")
+    train_feat, feature_label = _build_gene_features(
+        args.feature_mode,
+        names=train_gene,
+        states=train_cond,
+        model=model,
+        gene_names=gene_names,
+        cfg=cfg,
     )
-    _log(f"Co-expression embedding: {len(sym_to_vec):,} genes x {feat_dim} dims")
-
-    train_feat = features_for_names(train_gene, sym_to_vec, feat_dim)
-    test_feat = features_for_names(test_gene, sym_to_vec, feat_dim)
+    test_feat, _ = _build_gene_features(
+        args.feature_mode,
+        names=test_gene,
+        states=test_cond,
+        model=model,
+        gene_names=gene_names,
+        cfg=cfg,
+    )
+    feat_dim = train_feat.shape[1]
+    _log(f"Feature mode '{args.feature_mode}': feat_dim={feat_dim}")
 
     # Pair each perturbed cell with a same-condition control for the head input.
     train_ctrl_idx = sample_matched_controls(train_cond, control_cond, rng)
@@ -303,13 +400,14 @@ def main() -> None:
         "n_train_head_cells": int(train_z.shape[0]),
         "n_control_cells": int(control_z.shape[0]),
         "test_perturbations": test_genes,
-        "feature_mode": "coexpression_svd",
-        "coexpr_dim": int(feat_dim),
+        "feature_mode": args.feature_mode,
+        "feature_label": feature_label,
+        "feature_dim": int(feat_dim),
         "representation_quality": representation,
         "head_prediction": head_prediction,
         "baseline_mean_train_delta": baseline,
     }
-    out = run_dir / "perturbation_results.json"
+    out = run_dir / f"perturbation_results_{args.feature_mode}.json"
     out.write_text(json.dumps(results, indent=2))
     print(json.dumps(results, indent=2))
     _log(f"Wrote {out}")
